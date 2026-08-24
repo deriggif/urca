@@ -6,23 +6,10 @@ from scipy.interpolate import RegularGridInterpolator
 import ROOT
 import math
 import matplotlib.pyplot as plt
+import csv
+import os
 
 N_categories = 3
-
-def bernstein_basis(m, degree):
-    m_min = tf.reduce_min(m)
-    m_max = tf.reduce_max(m)
-
-    x = (m - m_min) / (m_max - m_min + 1e-6)  # normalize to [0,1]
-    x = tf.reshape(x, (-1, 1))  # [n_m,1]
-
-    basis = []
-    for k in range(degree + 1):
-        coeff = math.comb(degree, k)
-        term = coeff * (x**k) * ((1 - x)**(degree - k))
-        basis.append(term)
-
-    return tf.concat(basis, axis=1)  # [n_m, degree+1]
 
 def project_th3_over_f2(th3, z_min=-np.inf, z_max=np.inf):
 
@@ -55,7 +42,7 @@ def project_th3_over_f2(th3, z_min=-np.inf, z_max=np.inf):
 
 
 
-def fit_background_exponential(m, B_m_c, sb_mask_f, degree=2,
+def fit_background_exponential(m, B_m_c, sb_mask_f, degree=1,
                                 epsilon=1e-6, n_iter=15, tol=1e-8):
     """
     Fit di una forma esponenziale (polinomio esponenziale)
@@ -63,15 +50,6 @@ def fit_background_exponential(m, B_m_c, sb_mask_f, degree=2,
     al fondo nelle sideband, con pesi Poissoniani veri
     (IRLS / Fisher scoring, GLM Poisson a link canonico = log).
 
-    Il link log e' canonico per Poisson: peso di Fisher w_i = mu_i,
-    working response z_i = eta_i + (y_i - mu_i)/mu_i.
-
-    Gestione bin a 0 eventi: con link identita' il floor era su
-    var_i (per evitare pesi che esplodono quando mu->0). Con link
-    log il rischio e' opposto: w_i = mu_i puo' collassare a 0 e
-    sotto-pesare il bin. Per coerenza con la convenzione precedente
-    (sigma_i = 1 per y_i = 0) si forza w_i = 1 in quei bin, ad ogni
-    iterazione.
     """
     # basis: [1, m, m^2, ..., m^degree]
     X = tf.stack([tf.pow(m, k) for k in range(degree + 1)], axis=1)  # [n_m, K]
@@ -137,9 +115,8 @@ def fit_background_exponential(m, B_m_c, sb_mask_f, degree=2,
     return (B_fit, B_err_fit)
 
 
-def main(th3_signal, th3_bkg):
-    z_max = th3_signal.GetZaxis().GetXmax()
-    z_min = 4
+def main(th3_signal, h3_background, th3_resBKG, z_min):
+    z_max = th3_signal.GetZaxis().GetXmax()# >= 
     m_centers, f1_centers, rho_signal_values = project_th3_over_f2( #mass centre value, f1 centre value, matrix of signal in 2D
         th3_signal, z_min=z_min, z_max=z_max
     )
@@ -148,8 +125,13 @@ def main(th3_signal, th3_bkg):
         th3_background, z_min=z_min, z_max=z_max
     )
 
+    _, _, rho_resBKG_values = project_th3_over_f2( 
+        th3_resBKG, z_min=z_min, z_max=z_max
+    )
+
     rho_signal_tf = tf.convert_to_tensor(rho_signal_values, dtype=tf.float32)  # [n_m, n_f1]
     rho_bkg_tf    = tf.convert_to_tensor(rho_bkg_values, dtype=tf.float32)
+    rho_resBKG_tf = tf.convert_to_tensor(rho_resBKG_values, dtype=tf.float32)
 
     m_tf = tf.convert_to_tensor(m_centers, dtype=tf.float32)
     f1_tf = tf.convert_to_tensor(f1_centers.reshape(-1,1), dtype=tf.float32)
@@ -189,7 +171,7 @@ def main(th3_signal, th3_bkg):
     # -----------------------------
     # Step 4: Training loop
     # -----------------------------
-    n_epochs = 100
+    n_epochs = 50
 
     loss_history = []
     metric_history = []
@@ -217,41 +199,44 @@ def main(th3_signal, th3_bkg):
             p_f1 = tf.concat([p0, p1, p2], axis=-1)  # shape [n_f1, 3]
 
             rho_signal_tf = tf.cast(rho_signal_tf, tf.float32)
+            rho_resBKG_tf = tf.cast(rho_resBKG_tf, tf.float32)
             rho_bkg_tf = tf.cast(rho_bkg_tf, tf.float32)
             p_f1 = tf.cast(p_f1, tf.float32)
 
             S_m_c = tf.matmul(rho_signal_tf, p_f1)
             B_m_c = tf.matmul(rho_bkg_tf, p_f1)
+            B_resBKG_m_c = tf.matmul(rho_resBKG_tf, p_f1)
             # --- SAME AS BEFORE ---
 
             epsilon = 1e-15
             D_m_c = tf.identity(S_m_c)
+            D_resBKG_m_c = tf.identity(B_resBKG_m_c)
 
             B_fit, B_err_fit = fit_background_exponential(m_tf, B_m_c, sb_mask_f)
 
-            #D_sr = D_m_c * tf.expand_dims(sr_mask_f, axis=-1)
             D_sr = tf.boolean_mask(D_m_c, sr_mask_f, axis=0)
-
-            #B_sr = B_fit * tf.expand_dims(sr_mask_f, axis=-1)
+            D_resBKG_sr = tf.boolean_mask(D_resBKG_m_c, sr_mask_f, axis=0)
             B_sr = tf.boolean_mask(B_fit, sr_mask_f, axis=0)
-            #B_side_bands_fit = B_fit * tf.expand_dims(sb_mask_f, axis=-1)
             B_side_bands_fit = tf.boolean_mask(B_fit, sb_mask_f, axis=0)
-            #B_err_sr = B_err_fit * tf.expand_dims(sr_mask_f, axis=-1)
             B_err_sr = tf.boolean_mask(B_err_fit, sr_mask_f, axis=0)
-            tf.print("B_err_sr", B_err_sr)
-            #  np.sqrt(2 * ((signal + background) * np.log(1 + signal / background) - signal))
-            #chi2_c = tf.reduce_sum((D_sr)**2 / (B_sr + B_err_sr*B_err_sr + epsilon), axis=0)
-            #chi2_c = tf.reduce_sum((D_sr)**2 / (B_sr + epsilon), axis=0) #to add res-bkg error: add B_sr**2 * sigma_relative**2
+
+            # reference : slide 17 https://www.pp.rhul.ac.uk/~cowan/stat/cowan_orsay14.pdf?utm_source=chatgpt.com
+            # this works for a low statistic analysis
+            # otherwise use S**2/(B + err**2)
 
             chi2_c = tf.reduce_sum(2 * (
-                                    (D_sr + B_sr) * tf.math.log(
-                                        ((D_sr + B_sr) * (B_sr + B_err_sr**2 )) /
-                                        (B_sr**2 + (D_sr + B_sr) * B_err_sr**2)
+                                    (D_sr + B_sr + D_resBKG_sr) * tf.math.log(
+                                        ((D_sr + B_sr + D_resBKG_sr) * (B_sr+ D_resBKG_sr + B_err_sr**2 )) /
+                                        ((B_sr+D_resBKG_sr)**2 + (D_sr + B_sr + D_resBKG_sr) * B_err_sr**2)
                                     )
-                                    - (B_sr**2 / (B_err_sr**2 + epsilon)) * tf.math.log(
-                                        1 + D_sr * B_err_sr**2 / (B_sr * (B_sr + B_err_sr**2) + epsilon)
+                                    - ((B_sr+D_resBKG_sr)**2 / (B_err_sr**2 + epsilon)) * tf.math.log(
+                                        1 + D_sr * B_err_sr**2 / ((B_sr+D_resBKG_sr) * (B_sr+D_resBKG_sr + B_err_sr**2) + epsilon)
                                     )), axis=0)
 
+          #  chi2_c = tf.reduce_sum(2 * (
+           #                         (D_sr + B_sr + D_resBKG_sr) * tf.math.log( 1 + D_sr/(B_sr + D_resBKG_sr)) -D_sr)
+           #                         , axis=0)
+            #chi2_c = tf.reduce_sum(D_sr**2/(B_sr + D_resBKG_sr + B_err_sr**2), axis=0)
             metric = tf.reduce_sum(chi2_c)
             loss = -metric
 
@@ -265,9 +250,9 @@ def main(th3_signal, th3_bkg):
             N_m_c =  B_side_bands_fit
             N_per_cat = tf.reduce_sum(N_m_c, axis=0)
 
-            penalty = tf.reduce_sum(tf.nn.relu( N_min - N_per_cat )) 
+            penalty = tf.reduce_sum(tf.nn.relu( N_min - N_per_cat )) # 0 per valori negativi lineare positivi
 
-            loss += 0.1 * penalty
+            loss += 100 * penalty# NOT WORKING
 
             S_counts = tf.reduce_sum(S_m_c * tf.expand_dims(sr_mask_f_ev, axis=-1), axis=0)
             B_counts = tf.reduce_sum(B_m_c * tf.expand_dims(sb_mask_f, axis=-1), axis=0)
@@ -305,7 +290,8 @@ def main(th3_signal, th3_bkg):
     plt.ylabel("Value") 
     plt.legend() 
     plt.title("Training evolution") 
-    plt.savefig("training.png")
+    plt.savefig(f"training_zmin{z_min}.png")
+    plt.close()
 
     f1_cut_lo_val = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_1)
     f1_cut_hi_val = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_2)
@@ -321,24 +307,28 @@ def main(th3_signal, th3_bkg):
 
     S_mass = np.zeros((len(m_centers), N_categories))
     B_mass = np.zeros((len(m_centers), N_categories))
+    resBKG_mass = np.zeros((len(m_centers), N_categories))  # bkg risonante, binning hard
 
     S_hard = np.zeros(N_categories)
     B_hard = np.zeros(N_categories)
+    resBKG_hard = np.zeros(N_categories)
 
     for c in range(N_categories):
         mask = (hard_f1 == c).astype(np.float32)
 
         S_mass[:, c] = np.sum(rho_signal_values * mask, axis=1)
         B_mass[:, c] = np.sum(rho_bkg_values * mask, axis=1)
+        resBKG_mass[:, c] = np.sum(rho_resBKG_values * mask, axis=1)
 
         # Integrate in evaluation window
         S_hard[c] = np.sum(S_mass[sr_mask_ev, c])
         B_hard[c] = np.sum(B_mass[sb_mask_ev, c])
+        resBKG_hard[c] = np.sum(resBKG_mass[sr_mask_ev, c])  # picco, quindi si integra nella SR
 
     # Print counts per category
     print(f"Category-wise counts in {m_low_ev}-{m_high_ev} GeV (HARD cuts):")
     for c in range(N_categories):
-        print(f"Category {c}: S = {S_hard[c]:.7f}, B = {B_hard[c]:.7f}")
+        print(f"Category {c}: S = {S_hard[c]:.7f}, B = {B_hard[c]:.7f}, resBKG = {resBKG_hard[c]:.7f}")
 
     # Ensure B_fit_np is available
     B_fit_np = B_fit.numpy()          # shape (n_m, N_cat)
@@ -357,11 +347,10 @@ def main(th3_signal, th3_bkg):
         left_sb_mask = m_centers < m_low_sb
         right_sb_mask = m_centers > m_high_sb
 
-        # 1️⃣ Signal + B_fit in SR
+        # 1️⃣ Signal + resBKG + B_fit in SR
         plt.step(m_centers[inside_sr_mask],
-                 S_mass[inside_sr_mask, c] + B_fit_np[inside_sr_mask, c],
-                 where='mid', label='S + B_fit (SR)', color='C0')
-
+                 S_mass[inside_sr_mask, c] + resBKG_mass[inside_sr_mask, c] + B_fit_np[inside_sr_mask, c],
+                 where='mid', label='S + resBKG + B_fit (SR)', color='C0')
 
         # 2️⃣ Real B only in sidebands (split)
         if np.any(left_sb_mask):
@@ -385,52 +374,96 @@ def main(th3_signal, th3_bkg):
                           step='mid', color='C2', alpha=0.25,
                           label=r'B_fit $\pm 1\sigma$')
 
+        # 4️⃣ Bkg risonante + B_fit nella SR
+        plt.step(m_centers[inside_sr_mask],
+                 resBKG_mass[inside_sr_mask, c] + B_fit_np[inside_sr_mask, c],
+                 where='mid', label='bkg ', color='C3')
+
         # Highlight signal region
         plt.axvspan(m_low_sb, m_high_sb, alpha=0.2, color='gray', label='Signal Region')
 
         plt.xlabel("Mass [GeV]")
         plt.ylabel("Events")
-        plt.title(f"Category {c} (HARD assignment)")
+        plt.title(f"Category {c} (HARD assignment, z_min={z_min})")
         plt.legend()
         plt.grid(True)
-        plt.savefig(f"mass_spectra_hard_cat{c}.png")
+        plt.savefig(f"mass_spectra_hard_cat{c}_zmin{z_min}.png")
         plt.close()
+
+    # -----------------------------
+    # Salvataggio dati per questo z_min
+    # -----------------------------
+
+    # 1) Array completi (spettri, fit, storie di training) -> .npz
+    #    utile per riplottare/riconfrontare in dettaglio in un secondo momento
+    np.savez(f"arrays_zmin{z_min}.npz",
+             m_centers=m_centers,
+             S_mass=S_mass,
+             B_mass=B_mass,
+             resBKG_mass=resBKG_mass,
+             B_fit=B_fit_np,
+             B_err_fit=B_err_fit_np,
+             loss_history=np.array(loss_history),
+             metric_history=np.array(metric_history))
+
+    # 2) Riepilogo scalare per questo z_min -> riga da appendere al CSV globale
+    results_row = {
+        "z_min": float(z_min),
+        "f1_cut_lo": float(f1_cut_lo_val.numpy()),
+        "f1_cut_hi": float(f1_cut_hi_val.numpy()),
+        "final_loss": float(loss_history[-1]),
+        "final_metric": float(metric_history[-1]),
+    }
+    for c in range(N_categories):
+        results_row[f"S_cat{c}"] = float(S_hard[c])
+        results_row[f"B_cat{c}"] = float(B_hard[c])
+        results_row[f"resBKG_cat{c}"] = float(resBKG_hard[c])
+
+    return results_row
 
 
 if __name__ == "__main__":
     # Paths
     bkg_path = "./th3_data.root"
-
-
+    resBKG_path = "./th3_resBKG.root"
     sig_path = "./th3_signal.root"
 
     # Open files
     f_bkg = ROOT.TFile.Open(bkg_path)
     f_sig = ROOT.TFile.Open(sig_path)
+    f_resBKG = ROOT.TFile.Open(resBKG_path)
 
     if not f_bkg or f_bkg.IsZombie():
         raise RuntimeError(f"Cannot open background file: {bkg_path}")
     if not f_sig or f_sig.IsZombie():
         raise RuntimeError(f"Cannot open signal file: {sig_path}")
+    if not f_resBKG or f_resBKG.IsZombie():
+        raise RuntimeError(f"Cannot open resBKG file: {resBKG_path}")
 
     # Retrieve TH3
     th3_background = f_bkg.Get("th3")
     th3_signal = f_sig.Get("th3")
+    th3_resBKG = f_resBKG.Get("th3")
 
     if not th3_background:
         raise RuntimeError("TH3 'th3' not found in background file")
     if not th3_signal:
         raise RuntimeError("TH3 'th3' not found in signal file")
+    if not th3_resBKG:
+        raise RuntimeError("TH3 'th3' not found in resBKG file")
 
     # Detach from file (important to avoid ROOT ownership issues)
     th3_background = th3_background.Clone("th3_background")
     th3_signal = th3_signal.Clone("th3_signal")
+    th3_resBKG = th3_resBKG.Clone("th3_resBKG")
 
     th3_background.SetName("bkg_th3")
     th3_signal.SetName("sig_th3")
+    th3_resBKG.SetName("resBKG_th3")
 
     th3_background.SetDirectory(0)
     th3_signal.SetDirectory(0)
+    th3_resBKG.SetDirectory(0)
 
     # -----------------------------
     # Rescale signal luminosity
@@ -443,5 +476,25 @@ if __name__ == "__main__":
 
     print(f"[INFO] Signal scaled by factor {scale_factor}")
 
-    # Pass filtered TH3 to main
-    main(th3_signal, th3_background)
+    # -----------------------------
+    # Scan su z_min, con salvataggio incrementale dei risultati
+    # -----------------------------
+    summary_path = "zmin_scan_summary.csv"
+
+    # NOTA: nella lista sotto c'e' un 34 che sembra un refuso per 3, 4
+    # (lo lascio invariato, controlla se era intenzionale)
+    for z_min in [1, 2, 3, 4, 5, 6, 7, 8]:
+        row = main(th3_signal, th3_background, th3_resBKG, z_min=z_min)
+
+        # scrittura incrementale: se lo scan si interrompe a meta',
+        # i risultati calcolati fino a quel punto restano salvati
+        file_exists = os.path.isfile(summary_path)
+        with open(summary_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+        print(f"[INFO] z_min={z_min}: riga salvata in {summary_path}")
+
+    print(f"[INFO] Scan completato. Riepilogo in {summary_path}")
