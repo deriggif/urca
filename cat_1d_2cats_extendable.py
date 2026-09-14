@@ -1,5 +1,6 @@
-#python3 -m venv ~/venvs/tensorflow
-#source ~/venvs/tensorflow/bin/activate
+
+#source /cvmfs/sft.cern.ch/lcg/views/LCG_106/x86_64-el9-gcc13-opt/setup.sh
+
 import numpy as np
 import tensorflow as tf
 from scipy.interpolate import RegularGridInterpolator
@@ -8,6 +9,8 @@ import math
 import matplotlib.pyplot as plt
 import csv
 import os
+import mplhep as hep
+hep.style.use(hep.style.CMS)
 
 N_categories = 3
 
@@ -137,20 +140,16 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
     f1_tf = tf.convert_to_tensor(f1_centers.reshape(-1,1), dtype=tf.float32)
    
     f1_min = float(tf.reduce_min(f1_tf))
-    print('f1_min')
-    print(f1_min)
     f1_max = float(tf.reduce_max(f1_tf))
-    print('f1_max')
-    print(f1_max)
 
-    cut_raw_1 = tf.Variable(0.6, dtype=tf.float32)
-    cut_raw_2 = tf.Variable(0.9, dtype=tf.float32)
+    cut_raw_1 = tf.Variable(0.518, dtype=tf.float32)
+    cut_raw_2 = tf.Variable(0.913, dtype=tf.float32)
 
     trainable_vars = [cut_raw_1, cut_raw_2]
 
     #defining the window in which performing the fit
 
-    m_low, m_high = 120.0, 130.0  # adjust if needed
+    m_low, m_high = 115.0, 135.0  # adjust if needed # SAME AS DISCRETE PROFILING 
 
     sr_mask = tf.logical_and(m_tf >= m_low, m_tf <= m_high)
     sb_mask = tf.logical_not(sr_mask)
@@ -171,24 +170,34 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
     # -----------------------------
     # Step 4: Training loop
     # -----------------------------
-    n_epochs = 50
+    n_epochs = 1000
+    # --- Schedule per tau ---
+    tau_start = 0.05 * (f1_max - f1_min)   # molto più largo di 1e-3
+    #tau_start = 0.005 * (f1_max - f1_min)   # molto più largo di 1e-3
+    tau_end   = 1e-3 * (f1_max - f1_min)   # il valore finale che avevo fisso
 
     loss_history = []
     metric_history = []
-
+    metric_no_fit_err_history = []
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.05)
 
     for epoch in range(n_epochs):
         with tf.GradientTape() as tape:
 
             # Project to (m, category)
+
             c_a = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_1)
             c_b = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_2)
+
+            
+            print("cut_raw_1", cut_raw_1)
+            print("cut_raw_2", cut_raw_2)
 
             f1_cut_lo = tf.minimum(c_a, c_b)
             f1_cut_hi = tf.maximum(c_a, c_b)
 
-            tau = 1e-3 * (f1_max - f1_min)
+            frac = epoch / max(n_epochs - 1, 1)
+            tau = tau_start * (tau_end / tau_start) ** frac
 
             s_lo = tf.sigmoid((f1_tf - f1_cut_lo) / tau)  # 0 sotto cut_lo, 1 sopra
             s_hi = tf.sigmoid((f1_tf - f1_cut_hi) / tau)  # 0 sotto cut_hi, 1 sopra
@@ -214,55 +223,50 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
 
             B_fit, B_err_fit = fit_background_exponential(m_tf, B_m_c, sb_mask_f)
 
-            D_sr = tf.boolean_mask(D_m_c, sr_mask_f, axis=0)
-            D_resBKG_sr = tf.boolean_mask(D_resBKG_m_c, sr_mask_f, axis=0)
-            B_sr = tf.boolean_mask(B_fit, sr_mask_f, axis=0)
-            B_side_bands_fit = tf.boolean_mask(B_fit, sb_mask_f, axis=0)
-            B_err_sr = tf.boolean_mask(B_err_fit, sr_mask_f, axis=0)
+            D_sr = tf.boolean_mask(D_m_c, sr_mask_f_ev, axis=0)
+            D_resBKG_sr = tf.boolean_mask(D_resBKG_m_c, sr_mask_f_ev, axis=0)
+            B_sr = tf.boolean_mask(B_fit, sr_mask_f_ev, axis=0)
+            B_err_sr = tf.boolean_mask(B_err_fit, sr_mask_f_ev, axis=0) #123,127
+
+            B_side_bands_fit = tf.boolean_mask(B_fit, sb_mask_f, axis=0) #115,135
+            
 
             # reference : slide 17 https://www.pp.rhul.ac.uk/~cowan/stat/cowan_orsay14.pdf?utm_source=chatgpt.com
             # this works for a low statistic analysis
             # otherwise use S**2/(B + err**2)
-
+            epsilon=0
             chi2_c = tf.reduce_sum(2 * (
                                     (D_sr + B_sr + D_resBKG_sr) * tf.math.log(
                                         ((D_sr + B_sr + D_resBKG_sr) * (B_sr+ D_resBKG_sr + B_err_sr**2 )) /
                                         ((B_sr+D_resBKG_sr)**2 + (D_sr + B_sr + D_resBKG_sr) * B_err_sr**2)
                                     )
-                                    - ((B_sr+D_resBKG_sr)**2 / (B_err_sr**2 + epsilon)) * tf.math.log(
-                                        1 + D_sr * B_err_sr**2 / ((B_sr+D_resBKG_sr) * (B_sr+D_resBKG_sr + B_err_sr**2) + epsilon)
+                                    - ((B_sr+D_resBKG_sr)**2 / (B_err_sr**2 + epsilon)) * tf.math.log1p(
+                                         D_sr * B_err_sr**2 / ((B_sr+D_resBKG_sr) * (B_sr+D_resBKG_sr + B_err_sr**2) + epsilon)
                                     )), axis=0)
 
-          #  chi2_c = tf.reduce_sum(2 * (
-           #                         (D_sr + B_sr + D_resBKG_sr) * tf.math.log( 1 + D_sr/(B_sr + D_resBKG_sr)) -D_sr)
-           #                         , axis=0)
-            #chi2_c = tf.reduce_sum(D_sr**2/(B_sr + D_resBKG_sr + B_err_sr**2), axis=0)
-            metric = tf.reduce_sum(chi2_c)
-            loss = -metric
+            chi2_c_no_fit_err = tf.reduce_sum(2 * (
+                                    (D_sr + B_sr + D_resBKG_sr) * tf.math.log1p( D_sr/(B_sr + D_resBKG_sr)) -D_sr)
+                                    , axis=0)
 
-            # --- Balance penalty ---
-            #frac_per_cat = tf.reduce_mean(p_f1, axis=0)
-            #penalty = tf.reduce_sum(tf.nn.relu(0.05 - frac_per_cat))
+       
 
             N_min = 10
+            N_per_cat = tf.reduce_sum(B_side_bands_fit, axis=0)
+            penalty = tf.reduce_max(tf.nn.relu( N_min - N_per_cat )) # 0 per valori negativi lineare positivi
 
-            N_m_c = S_m_c + B_m_c
-            N_m_c =  B_side_bands_fit
-            N_per_cat = tf.reduce_sum(N_m_c, axis=0)
+            metric = tf.reduce_sum(chi2_c)
 
-            penalty = tf.reduce_sum(tf.nn.relu( N_min - N_per_cat )) # 0 per valori negativi lineare positivi
+            metric_no_fit_err = tf.reduce_sum(chi2_c_no_fit_err)
 
-            loss += 100 * penalty# NOT WORKING
+            loss = -metric + 0.01 * penalty
+
 
             S_counts = tf.reduce_sum(S_m_c * tf.expand_dims(sr_mask_f_ev, axis=-1), axis=0)
-            B_counts = tf.reduce_sum(B_m_c * tf.expand_dims(sb_mask_f, axis=-1), axis=0)
             B_counts_sr = tf.reduce_sum(B_sr, axis=0)
-            B_err_counts_sr = tf.reduce_sum(B_err_sr**2, axis=0)
-
             S_counts_np = S_counts.numpy()
-            B_counts_np = B_counts.numpy()
+
             for c in range(N_categories):
-                print(f"Epoch {epoch}: {m_low_ev}-{m_high_ev} GeV -  Category {c}: S={S_counts_np[c]:.7f}, B={B_counts_np[c]:.7f}  {chi2_c[c]:.7f} {B_counts_sr[c]:.7f}")
+                print(f"Epoch {epoch}: {m_low_ev}-{m_high_ev} GeV -  Category {c}: S={S_counts_np[c]:.7f}, B={N_per_cat[c]:.7f}  {chi2_c[c]:.7f} {B_counts_sr[c]:.7f}")
             print("metric", metric.numpy())
 
         # 4f. Apply gradients
@@ -278,7 +282,7 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
         print(f"Epoch {epoch}: loss = {loss.numpy():.4f}, metric = {metric.numpy():.4f}")
         loss_history.append(loss.numpy())
         metric_history.append(metric.numpy())
-
+        metric_no_fit_err_history.append(metric_no_fit_err.numpy())
 
     # -----------------------------
     # After training: HARD category evaluation
@@ -286,6 +290,7 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
 
     plt.figure() 
     plt.plot(metric_history, label="Metric") 
+    plt.plot(metric_no_fit_err_history, label="Metric no fit err")
     plt.xlabel("Epoch") 
     plt.ylabel("Value") 
     plt.legend() 
@@ -320,10 +325,10 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
         B_mass[:, c] = np.sum(rho_bkg_values * mask, axis=1)
         resBKG_mass[:, c] = np.sum(rho_resBKG_values * mask, axis=1)
 
-        # Integrate in evaluation window
-        S_hard[c] = np.sum(S_mass[sr_mask_ev, c])
-        B_hard[c] = np.sum(B_mass[sb_mask_ev, c])
-        resBKG_hard[c] = np.sum(resBKG_mass[sr_mask_ev, c])  # picco, quindi si integra nella SR
+        # Integrate in fit window
+        S_hard[c] = np.sum(S_mass[sr_mask, c])
+        B_hard[c] = np.sum(B_mass[sb_mask, c]) #135 115
+        resBKG_hard[c] = np.sum(resBKG_mass[sr_mask, c])  # picco, quindi si integra nella SR
 
     # Print counts per category
     print(f"Category-wise counts in {m_low_ev}-{m_high_ev} GeV (HARD cuts):")
@@ -336,38 +341,37 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
 
     m_low_sb, m_high_sb = 115, 135
 
+
     for c in range(N_categories):
-        plt.figure(figsize=(6,5))
+        B_masked = np.where(sb_mask, B_mass.T[c], 0)
+        B_err = np.sqrt(B_masked)
+        plt.figure(figsize=(15,10))
 
         # Masks
         inside_sr_mask = (m_centers >= m_low_sb) & (m_centers <= m_high_sb)
-        outside_sr_mask = ~inside_sr_mask
 
-        # Split sidebands into two continuous segments
-        left_sb_mask = m_centers < m_low_sb
-        right_sb_mask = m_centers > m_high_sb
-
-        # 1️⃣ Signal + resBKG + B_fit in SR
+        #  Signal + resBKG + B_fit in SR
         plt.step(m_centers[inside_sr_mask],
                  S_mass[inside_sr_mask, c] + resBKG_mass[inside_sr_mask, c] + B_fit_np[inside_sr_mask, c],
-                 where='mid', label='S + resBKG + B_fit (SR)', color='C0')
+                 where='mid', label='S + resBKG + B_fit (SR)', color='C1')
 
-        # 2️⃣ Real B only in sidebands (split)
-        if np.any(left_sb_mask):
-            plt.step(m_centers[left_sb_mask],
-                     B_mass[left_sb_mask, c],
-                     where='mid', color='C1', linestyle='--')
-        if np.any(right_sb_mask):
-            plt.step(m_centers[right_sb_mask],
-                     B_mass[right_sb_mask, c],
-                     where='mid', color='C1', linestyle='--', label='B (sidebands)')
+        # Real B only in sidebands (split)
+        plt.errorbar(
+            m_centers,
+            B_masked,
+            yerr=B_err,
+            fmt='o',
+            color='black',
+            label='data',
+            capsize=2
+        )
 
-        # 3️⃣ B_fit in the full range
+        #  B_fit in the full range
         plt.step(m_centers[:],
                  B_fit_np[:, c],
                  where='mid', label='B_fit (full range)', color='C2')
 
-        # 3️⃣bis banda d'errore ±1σ attorno a B_fit (fondo stimato dal fit)
+        # bis banda d'errore ±1σ attorno a B_fit (fondo stimato dal fit)
         plt.fill_between(m_centers,
                           B_fit_np[:, c] - B_err_fit_np[:, c],
                           B_fit_np[:, c] + B_err_fit_np[:, c],
@@ -483,7 +487,8 @@ if __name__ == "__main__":
 
     # NOTA: nella lista sotto c'e' un 34 che sembra un refuso per 3, 4
     # (lo lascio invariato, controlla se era intenzionale)
-    for z_min in [1, 2, 3, 4, 5, 6, 7, 8]:
+    #for z_min in [1, 2, 3, 4, 5, 6, 7, 8]:
+    for z_min in [3]:
         row = main(th3_signal, th3_background, th3_resBKG, z_min=z_min)
 
         # scrittura incrementale: se lo scan si interrompe a meta',
