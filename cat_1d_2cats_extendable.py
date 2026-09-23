@@ -170,11 +170,11 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
     # -----------------------------
     # Step 4: Training loop
     # -----------------------------
-    n_epochs = 1000
+    n_epochs = 500
     # --- Schedule per tau ---
-    tau_start = 0.05 * (f1_max - f1_min)   # molto più largo di 1e-3
+    tau_start = 0.1 * (f1_max - f1_min)   # molto più largo di 1e-3
     #tau_start = 0.005 * (f1_max - f1_min)   # molto più largo di 1e-3
-    tau_end   = 1e-3 * (f1_max - f1_min)   # il valore finale che avevo fisso
+    tau_end   = 0.1e-3 * (f1_max - f1_min)   # il valore finale che avevo fisso
 
     loss_history = []
     metric_history = []
@@ -186,12 +186,31 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
 
             # Project to (m, category)
 
-            c_a = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_1)
-            c_b = f1_min + (f1_max - f1_min) * tf.sigmoid(cut_raw_2)
+            noise_sigma = 0.001
 
-            
-            print("cut_raw_1", cut_raw_1)
-            print("cut_raw_2", cut_raw_2)
+            noise_1 = tf.random.normal(
+                shape=(),
+                mean=0.0,
+                stddev=noise_sigma,
+                dtype=tf.float32
+            )
+
+            noise_2 = tf.random.normal(
+                shape=(),
+                mean=0.0,
+                stddev=noise_sigma,
+                dtype=tf.float32
+            )
+
+            c_a = f1_min + (f1_max - f1_min) * tf.sigmoid(
+                cut_raw_1 + noise_1
+            )
+
+            c_b = f1_min + (f1_max - f1_min) * tf.sigmoid(
+                cut_raw_2 + noise_2
+            )
+
+        
 
             f1_cut_lo = tf.minimum(c_a, c_b)
             f1_cut_hi = tf.maximum(c_a, c_b)
@@ -253,21 +272,22 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
             N_min = 10
             N_per_cat = tf.reduce_sum(B_side_bands_fit, axis=0)
             penalty = tf.reduce_max(tf.nn.relu( N_min - N_per_cat )) # 0 per valori negativi lineare positivi
-
             metric = tf.reduce_sum(chi2_c)
-
             metric_no_fit_err = tf.reduce_sum(chi2_c_no_fit_err)
 
-            loss = -metric + 0.01 * penalty
+            loss = -metric + 0.005 * penalty
+            loss_no_fit_err = -metric_no_fit_err + 0.005 * penalty
 
+            metric =  - loss
+            metric_no_fit_err = - loss_no_fit_err
 
             S_counts = tf.reduce_sum(S_m_c * tf.expand_dims(sr_mask_f_ev, axis=-1), axis=0)
             B_counts_sr = tf.reduce_sum(B_sr, axis=0)
             S_counts_np = S_counts.numpy()
 
             for c in range(N_categories):
-                print(f"Epoch {epoch}: {m_low_ev}-{m_high_ev} GeV -  Category {c}: S={S_counts_np[c]:.7f}, B={N_per_cat[c]:.7f}  {chi2_c[c]:.7f} {B_counts_sr[c]:.7f}")
-            print("metric", metric.numpy())
+                print(f"Epoch {epoch}: {m_low_ev}-{m_high_ev} GeV -  Category {c}: S={S_counts_np[c]:.7f}, B={N_per_cat[c]:.7f}  {chi2_c[c]:.7f} {B_counts_sr[c]:.7f} , tau = {tau:.7f}, penalty = {penalty:.7f}")
+            print("metric Epoch", epoch, metric.numpy())
 
         # 4f. Apply gradients
 
@@ -289,8 +309,8 @@ def main(th3_signal, h3_background, th3_resBKG, z_min):
     # -----------------------------
 
     plt.figure() 
-    plt.plot(metric_history, label="Metric") 
-    plt.plot(metric_no_fit_err_history, label="Metric no fit err")
+    plt.plot(metric_history[:100], label="Metric") 
+    plt.plot(metric_no_fit_err_history[:100], label="Metric no fit err")
     plt.xlabel("Epoch") 
     plt.ylabel("Value") 
     plt.legend() 
